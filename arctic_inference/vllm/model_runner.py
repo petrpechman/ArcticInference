@@ -190,11 +190,19 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             N = input_tensor.shape[0]
 
             N_ulysses = N // sp_size
-            N_offset = N_ulysses * sp_rank
+            remainder = N % sp_size
+
+            # Compute start and end indices for distributing leftover items.
+            if remainder > sp_rank:
+                start_idx = N_ulysses * sp_rank + sp_rank
+                end_idx = start_idx + N_ulysses + 1
+            else:
+                start_idx = N_ulysses * sp_rank + remainder
+                end_idx = start_idx + N_ulysses
 
             # narrow the input
-            kwargs[input_key] = input_tensor[N_offset:N_offset + N_ulysses]
-            kwargs['positions'] = positions[N_offset:N_offset + N_ulysses]
+            kwargs[input_key] = input_tensor[start_idx:end_idx]
+            kwargs['positions'] = positions[start_idx:end_idx]
 
             with set_shift_parallel_mode(False):
                 output = model_forward(*args, **kwargs)
