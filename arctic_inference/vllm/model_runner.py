@@ -182,6 +182,13 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         model_forward = self.model.forward
         input_key = 'inputs_embeds' if self.is_multimodal_model else 'input_ids'
 
+        def extract_and_pad_shard(input, start_idx: int, end_idx: int, max_len: int):
+            local_len = end_idx - start_idx
+            shard = input[start_idx:end_idx]
+            padded = torch.zeros((max_len, *shard.shape[1:]), device=shard.device, dtype=shard.dtype)
+            padded[:local_len] = shard
+            return padded
+
         def ulysses_forward(*args, **kwargs):
             # update inputs
             input_tensor = kwargs[input_key]
@@ -200,12 +207,12 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 start_idx = N_ulysses * sp_rank + remainder
                 end_idx = start_idx + N_ulysses
 
-            local_len = end_idx - start_idx
+            if remainder > 0:
+                max_len = N_ulysses + 1
+            else:
+                max_len = N_ulysses
 
-            # Get max length of tensor
-            max_len = torch.tensor([local_len], device=input_tensor.device)
-            torch.distributed.all_reduce(max_len, op=torch.distributed.ReduceOp.MAX)
-            max_len = max_len.item()
+            local_len = end_idx - start_idx
 
             # Extract and pad the local shard
             shard_tensor = input_tensor[start_idx:end_idx]
@@ -225,16 +232,26 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 output = model_forward(*args, **kwargs)
 
             if output.size(0) == max_len:
-                # Remove padding
-                output = output[:local_len]
-
-                # all-gather model_output
-                model_output = torch.empty((N, self.hidden_size),
-                                           dtype=output.dtype,
-                                           device=output.device)
-                torch.distributed.all_gather_into_tensor(model_output,
-                                                         output,
-                                                         group=device_group)
+                gathered_output = torch.empty(
+                    (sp_size, max_len, self.hidden_size),
+                    dtype=output.dtype,
+                    device=output.device,
+                )
+                torch.distributed.all_gather_into_tensor(
+                    gathered_output,
+                    output,
+                    group=device_group,
+                )
+                
+                model_output_parts = []
+                for current_sp_size in range(sp_size):
+                    if remainder > current_sp_size:
+                        r_local_len = N_ulysses + 1    
+                    else:
+                        r_local_len = N_ulysses
+                    model_output_parts.append(gathered_output[current_sp_size, :r_local_len])
+                
+                model_output = torch.cat(model_output_parts, dim=0)
             else:
                 # SwiftKV models will already have all-gathered the output.
                 assert output.size(0) == N
