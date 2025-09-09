@@ -200,14 +200,34 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 start_idx = N_ulysses * sp_rank + remainder
                 end_idx = start_idx + N_ulysses
 
+            local_len = end_idx - start_idx
+
+            # Get max length of tensor
+            max_len = torch.tensor([local_len], device=input_tensor.device)
+            torch.distributed.all_reduce(max_len, op=torch.distributed.ReduceOp.MAX)
+            max_len = max_len.item()
+
+            # Extract and pad the local shard
+            shard_tensor = input_tensor[start_idx:end_idx]
+            shard_positions = positions[start_idx:end_idx]
+
+            padded_shard_tensor = torch.zeros((max_len, *shard_tensor.shape[1:]), device=shard_tensor.device, dtype=shard_tensor.dtype)
+            padded_shard_positions = torch.zeros((max_len, *shard_positions.shape[1:]), device=shard_positions.device, dtype=shard_positions.dtype)
+
+            padded_shard_tensor[:local_len] = shard_tensor
+            padded_shard_positions[:local_len] = shard_positions
+
             # narrow the input
-            kwargs[input_key] = input_tensor[start_idx:end_idx]
-            kwargs['positions'] = positions[start_idx:end_idx]
+            kwargs[input_key] = padded_shard_tensor
+            kwargs['positions'] = padded_shard_positions
 
             with set_shift_parallel_mode(False):
                 output = model_forward(*args, **kwargs)
 
-            if output.size(0) == N_ulysses:
+            if output.size(0) == max_len:
+                # Remove padding
+                output = output[:local_len]
+
                 # all-gather model_output
                 model_output = torch.empty((N, self.hidden_size),
                                            dtype=output.dtype,
