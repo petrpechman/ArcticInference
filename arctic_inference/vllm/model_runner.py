@@ -182,12 +182,16 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         model_forward = self.model.forward
         input_key = 'inputs_embeds' if self.is_multimodal_model else 'input_ids'
 
-        def extract_and_pad_shard(input, start_idx: int, end_idx: int, max_len: int):
-            local_len = end_idx - start_idx
-            shard = input[start_idx:end_idx]
-            padded = torch.zeros((max_len, *shard.shape[1:]), device=shard.device, dtype=shard.dtype)
-            padded[:local_len] = shard
-            return padded
+        def gather_and_unpad(tensor, N_ulysses: int, remainder: int):
+            unpadded_parts = []
+            for current_sp_size in range(sp_size):
+                if remainder > current_sp_size:
+                    current_len = N_ulysses + 1    
+                else:
+                    current_len = N_ulysses
+                unpadded_parts.append(tensor[current_sp_size, :current_len])
+            unpadded_tensor = torch.cat(unpadded_parts, dim=0)
+            return unpadded_tensor
 
         def ulysses_forward(*args, **kwargs):
             # update inputs
@@ -207,51 +211,35 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 start_idx = N_ulysses * sp_rank + remainder
                 end_idx = start_idx + N_ulysses
 
-            if remainder > 0:
-                max_len = N_ulysses + 1
-            else:
-                max_len = N_ulysses
-
+            max_len = N_ulysses + (1 if remainder > 0 else 0)
             local_len = end_idx - start_idx
 
-            # Extract and pad the local shard
-            shard_tensor = input_tensor[start_idx:end_idx]
-            shard_positions = positions[start_idx:end_idx]
-
-            padded_shard_tensor = torch.zeros((max_len, *shard_tensor.shape[1:]), device=shard_tensor.device, dtype=shard_tensor.dtype)
-            padded_shard_positions = torch.zeros((max_len, *shard_positions.shape[1:]), device=shard_positions.device, dtype=shard_positions.dtype)
-
-            padded_shard_tensor[:local_len] = shard_tensor
-            padded_shard_positions[:local_len] = shard_positions
-
             # narrow the input
-            kwargs[input_key] = padded_shard_tensor
-            kwargs['positions'] = padded_shard_positions
+            kwargs[input_key] = input_tensor[start_idx:end_idx]
+            kwargs['positions'] = positions[start_idx:end_idx]
 
             with set_shift_parallel_mode(False):
                 output = model_forward(*args, **kwargs)
 
-            if output.size(0) == max_len:
+            if output.size(0) == local_len:
+                # Prepare padded tensor to gather outputs from all ranks
+                output_padded = torch.empty((max_len, *output.shape[1:]), device=output.device, dtype=output.dtype)
+                output_padded[:local_len] = output
+
                 gathered_output = torch.empty(
                     (sp_size, max_len, self.hidden_size),
-                    dtype=output.dtype,
-                    device=output.device,
+                    dtype=output_padded.dtype,
+                    device=output_padded.device,
                 )
+
+                # all-gather model_output
                 torch.distributed.all_gather_into_tensor(
                     gathered_output,
-                    output,
+                    output_padded,
                     group=device_group,
                 )
-                
-                model_output_parts = []
-                for current_sp_size in range(sp_size):
-                    if remainder > current_sp_size:
-                        r_local_len = N_ulysses + 1    
-                    else:
-                        r_local_len = N_ulysses
-                    model_output_parts.append(gathered_output[current_sp_size, :r_local_len])
-                
-                model_output = torch.cat(model_output_parts, dim=0)
+
+                model_output = gather_and_unpad(gathered_output, N_ulysses, remainder)
             else:
                 # SwiftKV models will already have all-gathered the output.
                 assert output.size(0) == N
