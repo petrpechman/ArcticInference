@@ -182,6 +182,22 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         model_forward = self.model.forward
         input_key = 'inputs_embeds' if self.is_multimodal_model else 'input_ids'
 
+        def extract_and_pad_shard(tensor, start_idx: int, end_idx: int, max_len: int):
+            local_len = end_idx - start_idx
+            shard = tensor[start_idx:end_idx]
+
+            if tensor.dtype.is_floating_point:
+                pad_value = 0.0
+            elif tensor.dtype in (torch.int, torch.long, torch.int32, torch.int64):
+                pad_value = -1
+            else:
+                pad_value = 0
+
+            padded = torch.full((max_len, *shard.shape[1:]), pad_value, device=shard.device, dtype=shard.dtype)
+            padded[:local_len] = shard
+
+            return padded
+
         def gather_and_unpad(tensor, N_ulysses: int, remainder: int):
             unpadded_parts = []
             for current_sp_size in range(sp_size):
@@ -212,30 +228,28 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 end_idx = start_idx + N_ulysses
 
             max_len = N_ulysses + (1 if remainder > 0 else 0)
-            local_len = end_idx - start_idx
+
+            padded_input_tensor = extract_and_pad_shard(input_tensor, start_idx, end_idx, max_len)
+            padded_positions = extract_and_pad_shard(positions, start_idx, end_idx, max_len)
 
             # narrow the input
-            kwargs[input_key] = input_tensor[start_idx:end_idx]
-            kwargs['positions'] = positions[start_idx:end_idx]
+            kwargs[input_key] = padded_input_tensor
+            kwargs['positions'] = padded_positions
 
             with set_shift_parallel_mode(False):
                 output = model_forward(*args, **kwargs)
 
-            if output.size(0) == local_len:
-                # Prepare padded tensor to gather outputs from all ranks
-                output_padded = torch.empty((max_len, *output.shape[1:]), device=output.device, dtype=output.dtype)
-                output_padded[:local_len] = output
-
+            if output.size(0) == max_len:
                 gathered_output = torch.empty(
                     (sp_size, max_len, self.hidden_size),
-                    dtype=output_padded.dtype,
-                    device=output_padded.device,
+                    dtype=output.dtype,
+                    device=output.device,
                 )
 
                 # all-gather model_output
                 torch.distributed.all_gather_into_tensor(
                     gathered_output,
-                    output_padded,
+                    output,
                     group=device_group,
                 )
 
