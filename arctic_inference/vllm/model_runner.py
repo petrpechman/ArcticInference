@@ -603,6 +603,11 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 common_attn_metadata,
             )
 
+        if self.speculative_config.method != "suffix":
+            limits_bitmask = list(scheduler_output.num_scheduled_tokens.values())
+            for i, (result, limit) in enumerate(zip(results, limits_bitmask)):
+                spec_token_ids[i] = spec_token_ids[i][:limit]
+
         if spec_token_ids is None:
             spec_token_ids = suffix_spec_token_ids
         elif suffix_spec_token_ids is not None:
